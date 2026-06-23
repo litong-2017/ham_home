@@ -4,11 +4,7 @@ import {
   buildCategoryTree,
   formatCategoryHierarchy,
 } from "@/lib/preset-categories";
-import type {
-  AnalysisResult,
-  LocalCategory,
-  PageContent,
-} from "@/types";
+import type { AnalysisResult, LocalCategory, PageContent } from "@/types";
 import {
   createAIRecommendedCategory,
   matchCategoryByName,
@@ -30,6 +26,7 @@ export interface EnhancedAnalyzeInput {
   pageContent: PageContent;
   userCategories?: LocalCategory[];
   existingTags?: string[];
+  signal?: AbortSignal;
 }
 
 export interface BookmarkAnalysisApplyResult {
@@ -69,6 +66,7 @@ class BookmarkAnalysisService {
         apiMode: config.apiMode,
         temperature: config.temperature ?? 0.2,
         maxTokens: config.maxTokens ?? 900,
+        abortSignal: input.signal,
         schema: bookmarkAnalysisSchema,
         system:
           config.language === "zh"
@@ -96,7 +94,9 @@ class BookmarkAnalysisService {
         title: output.title.trim(),
         summary: output.summary.trim(),
         category: output.category.trim(),
-        tags: [...new Set(output.tags.map((tag) => tag.trim()).filter(Boolean))],
+        tags: [
+          ...new Set(output.tags.map((tag) => tag.trim()).filter(Boolean)),
+        ],
       };
     } catch (error) {
       throw new Error(getAgentErrorMessage(error, "书签分析失败"));
@@ -110,13 +110,17 @@ class BookmarkAnalysisService {
     currentCategories: LocalCategory[];
     existingTags?: string[];
     shouldFetchPageContent?: boolean;
+    signal?: AbortSignal;
   }): Promise<BookmarkAnalysisApplyResult> {
     let content = "";
     if (options.shouldFetchPageContent) {
       try {
         content = await fetchPageContentForAI(options.url);
       } catch (error) {
-        console.warn(`[BookmarkAnalysisService] Failed to fetch page content for ${options.url}, falling back to description. Error:`, error);
+        console.warn(
+          `[BookmarkAnalysisService] Failed to fetch page content for ${options.url}, falling back to description. Error:`,
+          error,
+        );
         content = options.description || "";
       }
     }
@@ -145,6 +149,7 @@ class BookmarkAnalysisService {
       },
       userCategories: options.currentCategories,
       existingTags: options.existingTags,
+      signal: options.signal,
     });
 
     let categoryId: string | null = null;

@@ -9,13 +9,21 @@ export interface GenerateStructuredObjectOptions extends AgentModelConfig {
   system?: string;
   temperature?: number;
   maxTokens?: number;
+  abortSignal?: AbortSignal;
 }
 
 export async function generateStructuredObject(
   options: GenerateStructuredObjectOptions,
 ): Promise<any> {
-  const { schema, prompt, system, temperature, maxTokens, ...modelConfig } =
-    options;
+  const {
+    schema,
+    prompt,
+    system,
+    temperature,
+    maxTokens,
+    abortSignal,
+    ...modelConfig
+  } = options;
 
   const model = createAgentModel(modelConfig);
 
@@ -27,10 +35,14 @@ export async function generateStructuredObject(
       system,
       temperature,
       maxOutputTokens: maxTokens,
+      abortSignal,
     });
   } catch (e: any) {
     if (e.message?.includes("Invalid JSON response")) {
-      logger.warn("generateObject failed with Invalid JSON response, falling back to streamObject", { error: e.message });
+      logger.warn(
+        "generateObject failed with Invalid JSON response, falling back to streamObject",
+        { error: e.message },
+      );
       const result = await streamObject({
         model,
         schema: schema as any,
@@ -38,6 +50,7 @@ export async function generateStructuredObject(
         system,
         temperature,
         maxOutputTokens: maxTokens,
+        abortSignal,
       });
       const object = await readStructuredObjectFromTextStream(
         result.textStream,
@@ -54,9 +67,9 @@ export async function generateStructuredObject(
 async function readStructuredObjectFromTextStream<T>(
   textStream: AsyncIterable<string>,
   schema: {
-    safeParse?: (value: unknown) =>
-      | { success: true; data: T }
-      | { success: false; error: unknown };
+    safeParse?: (
+      value: unknown,
+    ) => { success: true; data: T } | { success: false; error: unknown };
   },
 ): Promise<T> {
   let text = "";

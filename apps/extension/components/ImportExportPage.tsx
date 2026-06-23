@@ -70,8 +70,8 @@ export function ImportExportPage() {
     resumeWatchers,
   } = useBookmarks();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // 取消导入的信号 flag，由 handleCancelImport 置为 true
-  const cancelledRef = useRef(false);
+  // 导入任务的中止控制器，点击「停止导入」时调用 .abort() 直接终止正在进行的 AI 请求
+  const abortControllerRef = useRef<AbortController | null>(null);
   const {
     getBookmarks: getChromeBookmarks,
     loading: loadingBrowserBookmarks,
@@ -196,7 +196,9 @@ export function ImportExportPage() {
 
   // 取消正在进行的 HTML 导入任务
   const handleCancelImport = async () => {
-    cancelledRef.current = true;
+    // abort() 会立即中止当前正在等待的 AI fetch 请求，
+    // runHtmlImportTask 捕获到 AbortError 后走取消分支
+    abortControllerRef.current?.abort();
     await importTaskStorage.cancelHtmlTask();
   };
 
@@ -239,20 +241,32 @@ export function ImportExportPage() {
       try {
         await runHtmlImportTask(task);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error
-            ? error.message
-            : t("settings.importExport.errors.unknown", { ns: "settings" });
+        if (error instanceof Error && error.name === "AbortError") {
+          setImportResult({
+            success: false,
+            cancelled: true,
+            message: t("settings.importExport.import.importCancelled", {
+              ns: "settings",
+            }),
+          });
+        } else {
+          const errorMessage =
+            error instanceof Error
+              ? error.message
+              : t("settings.importExport.errors.unknown", { ns: "settings" });
 
-        await importTaskStorage.markHtmlTaskFailed(errorMessage);
-        setImportResult({
-          success: false,
-          message: t("settings.importExport.importFailed", { ns: "settings" }),
-          details: errorMessage,
-          aiError: task.progress.aiError
-            ? { message: task.progress.aiError }
-            : undefined,
-        });
+          await importTaskStorage.markHtmlTaskFailed(errorMessage);
+          setImportResult({
+            success: false,
+            message: t("settings.importExport.importFailed", {
+              ns: "settings",
+            }),
+            details: errorMessage,
+            aiError: task.progress.aiError
+              ? { message: task.progress.aiError }
+              : undefined,
+          });
+        }
       } finally {
         // 恢复 watcher 并统一刷新一次
         resumeWatchers();
@@ -272,7 +286,7 @@ export function ImportExportPage() {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    cancelledRef.current = false;
+    abortControllerRef.current = new AbortController();
     setImporting(true);
     setImportResult(null);
 
@@ -294,11 +308,22 @@ export function ImportExportPage() {
         );
       }
     } catch (error) {
-      setImportResult({
-        success: false,
-        message: t("settings.importExport.importFailed", { ns: "settings" }),
-        details: resolveBookmarkError(error),
-      });
+      if (error instanceof Error && error.name === "AbortError") {
+        // 用户主动取消：显示取消提示而非失败提示
+        setImportResult({
+          success: false,
+          cancelled: true,
+          message: t("settings.importExport.import.importCancelled", {
+            ns: "settings",
+          }),
+        });
+      } else {
+        setImportResult({
+          success: false,
+          message: t("settings.importExport.importFailed", { ns: "settings" }),
+          details: resolveBookmarkError(error),
+        });
+      }
     } finally {
       // 恢复 watcher 并统一刷新一次
       resumeWatchers();
@@ -314,7 +339,7 @@ export function ImportExportPage() {
 
   // 从浏览器导入
   const handleBrowserImport = async () => {
-    cancelledRef.current = false;
+    abortControllerRef.current = new AbortController();
     setImporting(true);
     setImportResult(null);
 
@@ -327,14 +352,24 @@ export function ImportExportPage() {
       // 使用现有的 HTML 导入逻辑
       await importFromHTML(html, "browser");
     } catch (error) {
-      setImportResult({
-        success: false,
-        message: t("settings.importExport.importFailed", { ns: "settings" }),
-        details:
-          error instanceof Error
-            ? error.message
-            : t("settings.importExport.errors.unknown", { ns: "settings" }),
-      });
+      if (error instanceof Error && error.name === "AbortError") {
+        setImportResult({
+          success: false,
+          cancelled: true,
+          message: t("settings.importExport.import.importCancelled", {
+            ns: "settings",
+          }),
+        });
+      } else {
+        setImportResult({
+          success: false,
+          message: t("settings.importExport.importFailed", { ns: "settings" }),
+          details:
+            error instanceof Error
+              ? error.message
+              : t("settings.importExport.errors.unknown", { ns: "settings" }),
+        });
+      }
     } finally {
       // 恢复 watcher 并统一刷新一次
       resumeWatchers();
@@ -608,6 +643,7 @@ export function ImportExportPage() {
         currentCategories,
         existingTags,
         shouldFetchPageContent,
+        signal: abortControllerRef.current?.signal,
       });
 
       console.log(
@@ -615,6 +651,10 @@ export function ImportExportPage() {
       );
       return result;
     } catch (err) {
+      // AbortError 直接向上抛出，由 runHtmlImportTask 的取消分支处理
+      if (err instanceof Error && err.name === "AbortError") {
+        throw err;
+      }
       console.error("[ImportExport] AI analysis failed:", err);
       console.log(
         `[ImportExport][Perf] analyzeBookmarkWithAI FAILED(${url}): ${(performance.now() - aiStart).toFixed(1)}ms`,
@@ -783,6 +823,7 @@ export function ImportExportPage() {
   };
 
   const runHtmlImportTask = async (task: HtmlImportTask) => {
+    const abortSignal = abortControllerRef.current?.signal;
     const taskStart = performance.now();
     console.log(
       `[ImportExport][Perf] === Import task started === total: ${task.payload.total}, options:`,
@@ -856,8 +897,8 @@ export function ImportExportPage() {
       batchStart < task.payload.bookmarksToImport.length;
       batchStart += BATCH_SIZE
     ) {
-      // 每批次开始前检查取消信号
-      if (cancelledRef.current) {
+      // 每批次开始前检查中止信号
+      if (abortSignal?.aborted) {
         break;
       }
       batchIndex++;
@@ -910,6 +951,11 @@ export function ImportExportPage() {
           let newCategories: LocalCategory[] = [];
 
           try {
+            // 每条书签调用 AI 前先检查中止信号，让取消响应更即时
+            if (abortSignal?.aborted) {
+              throw new DOMException("Import cancelled", "AbortError");
+            }
+
             // 传入当前最新的 allCategories，确保能感知到本批次已创建的分类
             const aiResult = await analyzeBookmarkWithAI(
               bm.url,
@@ -934,7 +980,11 @@ export function ImportExportPage() {
               }
             }
           } catch (err) {
-            // AI 分析失败记录一次错误原因，但不阻断导入
+            // AbortError：用户主动取消，向上抛出跳出两层循环
+            if (err instanceof Error && err.name === "AbortError") {
+              throw err;
+            }
+            // 其他 AI 分析失败：记录一次错误原因，但不阻断导入
             if (!firstAiError) {
               firstAiError = err instanceof Error ? err.message : String(err);
             }
@@ -1059,29 +1109,6 @@ export function ImportExportPage() {
 
     setImportProgress(null);
 
-    // 任务被取消时，展示已处理的进度并提前返回
-    if (cancelledRef.current) {
-      await importTaskStorage.clearHtmlTask();
-      setImportResult({
-        success: false,
-        cancelled: true,
-        message: t("settings.importExport.import.importCancelled", {
-          ns: "settings",
-        }),
-        details: buildHTMLImportDetails(
-          {
-            imported,
-            skipped,
-            duplicateSkipped,
-            categoriesCreated,
-            aiProcessed,
-          },
-          options,
-        ),
-      });
-      return;
-    }
-
     // 批量添加 embedding 任务（在 background 中执行）
     if (importedBookmarkIds.length > 0) {
       try {
@@ -1146,11 +1173,16 @@ export function ImportExportPage() {
     try {
       await runHtmlImportTask(task);
     } catch (error) {
-      const errorMessage =
-        error instanceof Error
-          ? error.message
-          : t("settings.importExport.errors.unknown", { ns: "settings" });
-      await importTaskStorage.markHtmlTaskFailed(errorMessage);
+      if (error instanceof Error && error.name === "AbortError") {
+        // 用户主动取消：将任务标记为 cancelled，重新抛出由上层显示取消提示
+        await importTaskStorage.cancelHtmlTask();
+      } else {
+        const errorMessage =
+          error instanceof Error
+            ? error.message
+            : t("settings.importExport.errors.unknown", { ns: "settings" });
+        await importTaskStorage.markHtmlTaskFailed(errorMessage);
+      }
       throw error;
     }
   };
